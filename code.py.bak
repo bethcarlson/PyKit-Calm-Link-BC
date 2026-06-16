@@ -1,0 +1,283 @@
+import pykit_explorer
+import time
+import board
+import displayio
+import math
+
+from lcd_display import LCDDisplay, Colors
+from digital_io import EdgeDetector
+from neopixels import NeoPixels
+from audio_out import AudioOutput
+from imu_sensor import IMUSensor
+from cpu_temp import CPUTemperature
+
+SCREEN_WIDTH, SCREEN_HEIGHT = 240, 135
+BREATHE_INTERVAL, BREATHE_PHASES = 2.5, 4
+AGITATION_THRESHOLD_HIGH = 50
+AGITATION_THRESHOLD_ALERT = 80
+MODE_CALM, MODE_GROUND, MODE_ALERT = 0, 1, 2
+MODE_NAMES = ["CALM", "GROUND", "ALERT"]
+
+RED = (255, 0, 0)
+BLUE = (0, 0, 255)
+YELLOW = (255, 255, 0)
+GREEN = (0, 200, 50)
+
+# Breathing animation parameters
+INHALE_DURATION = 3.0
+EXHALE_DURATION = 3.0
+MIN_RADIUS = 15
+MAX_RADIUS = 45
+COLOR_CIRCLE = 0x5FE3FF
+BG_COLOR_BREATHING = 0xADD8E6
+CIRCLE_COLOR = 0x00008B
+
+class BreathingAnimator:
+    def __init__(self, lcd):
+        self.lcd = lcd
+        self.group = None
+        self.circle_label = None
+        self.breath_label = None
+        self.cycle_start = time.monotonic()
+        self.total_cycle = INHALE_DURATION + EXHALE_DURATION
+
+    def cosine_easing(self, t):
+        return (1 - math.cos(t * math.pi)) / 2
+
+    def update(self):
+        if self.group is None:
+            self.group, self.palette = self.lcd.make_group(BG_COLOR_BREATHING)
+            self.circle_label = self.lcd.add_label(self.group, "●", 120, 50, color=CIRCLE_COLOR, scale=1)
+            self.breath_label = self.lcd.add_label(self.group, "Inhale", 120, 110, color=Colors.CYAN, scale=2)
+
+        elapsed = time.monotonic() - self.cycle_start
+        cycle_position = (elapsed % self.total_cycle) / self.total_cycle
+
+        if cycle_position < INHALE_DURATION / self.total_cycle:
+            phase = cycle_position / (INHALE_DURATION / self.total_cycle)
+            breath_state = "Inhale"
+        else:
+            phase = (cycle_position - INHALE_DURATION / self.total_cycle) / (EXHALE_DURATION / self.total_cycle)
+            breath_state = "Exhale"
+
+        eased = self.cosine_easing(phase)
+        radius = MIN_RADIUS + (MAX_RADIUS - MIN_RADIUS) * eased
+        scale = max(1, int(radius / 10))
+
+        self.circle_label.scale = scale
+        self.breath_label.text = breath_state
+        self.lcd.display.refresh()
+
+class CalmLink:
+    def __init__(self):
+        print("\n=== CALMLINK+ INITIALIZING ===\n")
+        self.lcd = LCDDisplay()
+        self.lcd.backlight_on()
+        self.button = EdgeDetector(board.D3)
+        self.audio = AudioOutput()
+        self.px = NeoPixels()
+        self.cpu_temp = CPUTemperature()
+        
+        try:
+            self.imu = IMUSensor()
+            self.imu_available = True
+            print("[IMU] Connected")
+        except Exception as e:
+            print(f"[IMU] NOT CONNECTED: {e}")
+            self.imu = None
+            self.imu_available = False
+
+        try:
+            self.image_group = self.lcd.load_sprite("/Images/waterfall.bmp")
+            print("[Image] Loaded waterfall.bmp")
+        except Exception as e:
+            print(f"[Image] FAILED: {e}")
+            self.image_group = None
+
+        self.mode = MODE_CALM
+        self.breathing_phase = 0
+        self.breathing_timer = 0
+        self.motion_magnitude = 0
+        self.motion_readings = []
+        self.motion_startup_count = 0
+        self.agitation_level = "LOW"
+        self.engagement_state = "DISENGAGED"
+        self.session_start = time.monotonic()
+        self.log_interval = 5.0
+        self.last_log = 0
+
+        self.breathing_animator = None
+        self.breathing_active = False
+        self.breathing_group = None
+        self.breath_label = None
+        self.stats_group = None
+        self.temp_label = None
+        self.activity_label = None
+        
+        self.temp_readings = []
+        self.last_temp_read = 0
+
+        print("[CALMLINK+] Ready. Press D3 to switch modes.\n")
+
+    def play_tone(self):
+        try:
+            self.audio.sine_tone(200, duration_ms=400, volume=0.3)
+        except:
+            pass
+
+    def read_sensors(self):
+        if not self.imu_available:
+            self.motion_magnitude = 0
+            return
+            
+        try:
+            accel = self.imu.acceleration
+            ax, ay, az = accel[0], accel[1], accel[2]
+            self.motion_magnitude = math.sqrt(ax*ax + ay*ay + az*az)
+        except:
+            self.motion_magnitude = 0
+
+    def update_temperature(self):
+        now = time.monotonic()
+        if now - self.last_temp_read >= 1.0:
+            self.temp_readings.append(self.cpu_temp.fahrenheit)
+            if len(self.temp_readings) > 5:
+                self.temp_readings.pop(0)
+            self.last_temp_read = now
+
+    def get_avg_temperature(self):
+        if not self.temp_readings:
+            return self.cpu_temp.fahrenheit
+        return sum(self.temp_readings) / len(self.temp_readings)
+
+    def update_state(self):
+        if self.motion_startup_count < 250:
+            self.motion_startup_count += 1
+            self.agitation_level = "LOW"
+        else:
+            self.motion_readings.append(self.motion_magnitude)
+            if len(self.motion_readings) > 10:
+                self.motion_readings.pop(0)
+
+            avg_motion = sum(self.motion_readings) / len(self.motion_readings) if self.motion_readings else 0
+
+            if avg_motion < AGITATION_THRESHOLD_HIGH:
+                self.agitation_level = "LOW"
+            elif avg_motion < AGITATION_THRESHOLD_ALERT:
+                self.agitation_level = "MED"
+            else:
+                self.agitation_level = "HIGH"
+
+    def get_color(self):
+        if self.agitation_level == "HIGH":
+            return YELLOW
+        elif self.agitation_level == "MED":
+            return GREEN
+        else:
+            return BLUE
+
+    def display_image(self):
+        if self.image_group:
+            self.lcd.display.root_group = self.image_group
+            self.lcd.display.refresh()
+
+    def display_breathing_start(self):
+        if self.breathing_group is None:
+            self.breathing_group, _ = self.lcd.make_group(0x000000)
+            self.lcd.add_label(self.breathing_group, "Click to Start", 120, 60, color=Colors.WHITE, scale=2)
+        self.lcd.display.refresh()
+
+    def display_breathing(self):
+        if self.breathing_animator is None:
+            self.breathing_animator = BreathingAnimator(self.lcd)
+        self.breathing_animator.update()
+
+    def display_stats(self):
+        if self.stats_group is None:
+            self.stats_group, _ = self.lcd.make_group(0x1A0A1E)
+            self.lcd.add_label(self.stats_group, "PATIENT STATS", 120, 10, color=Colors.WHITE, scale=2)
+            
+            avg_temp = self.get_avg_temperature()
+            self.temp_label = self.lcd.add_label(self.stats_group, f"{avg_temp:.1f}F", 120, 45, color=Colors.CYAN, scale=2)
+            self.activity_label = self.lcd.add_label(self.stats_group, "Low", 120, 80, color=Colors.GREEN, scale=2)
+        
+        if self.temp_label is not None:
+            avg_temp = self.get_avg_temperature()
+            self.temp_label.text = f"{avg_temp:.1f}F"
+        
+        if self.activity_label is not None:
+            activity = "High" if self.agitation_level == "HIGH" else ("Med" if self.agitation_level == "MED" else "Low")
+            self.activity_label.text = activity
+        
+        self.lcd.display.refresh()
+
+    def update_display(self):
+        if self.mode == MODE_CALM:
+            self.display_image()
+        elif self.mode == MODE_GROUND:
+            if self.breathing_active:
+                self.display_breathing()
+            else:
+                self.display_breathing_start()
+        elif self.mode == MODE_ALERT:
+            self.display_stats()
+
+    def update_leds(self):
+        color = self.get_color()
+        brightness = math.sin(self.breathing_phase * math.pi / BREATHE_PHASES) * 0.5 + 0.5
+
+        if isinstance(color, tuple):
+            r, g, b = color
+            scaled = (int(r * brightness), int(g * brightness), int(b * brightness))
+        else:
+            scaled = color
+
+        self.px.fill(scaled)
+
+    def handle_button(self):
+        self.button.update()
+        if self.button.fell:
+            if self.mode == MODE_GROUND and not self.breathing_active:
+                self.breathing_active = True
+                self.breathing_animator = None
+            else:
+                self.mode = (self.mode + 1) % 3
+                self.breathing_active = False
+                self.breathing_animator = None
+                self.breathing_group = None
+                self.breath_label = None
+                self.stats_group = None
+                self.temp_label = None
+                self.activity_label = None
+            print(f"\n[MODE] → {MODE_NAMES[self.mode]}\n")
+            time.sleep(0.2)
+
+    def log_state(self):
+        elapsed = time.monotonic() - self.session_start
+        print(f"[{elapsed:6.1f}s] {MODE_NAMES[self.mode]:6} | Motion:{self.agitation_level:4}")
+
+    def run(self):
+        while True:
+            self.handle_button()
+            self.read_sensors()
+            self.update_state()
+            self.update_temperature()
+
+            self.breathing_timer += 0.02
+            if self.breathing_timer >= BREATHE_INTERVAL:
+                self.breathing_timer = 0
+                self.breathing_phase = (self.breathing_phase + 1) % BREATHE_PHASES
+                self.play_tone()
+
+            self.update_display()
+            self.update_leds()
+
+            now = time.monotonic()
+            if now - self.last_log >= self.log_interval:
+                self.log_state()
+                self.last_log = now
+
+            time.sleep(0.02)
+
+device = CalmLink()
+device.run()
